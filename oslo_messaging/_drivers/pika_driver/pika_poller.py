@@ -13,6 +13,7 @@
 #    under the License.
 
 import threading
+import collections
 
 from oslo_log import log as logging
 from oslo_utils import timeutils
@@ -24,6 +25,48 @@ from oslo_messaging._drivers.pika_driver import pika_exceptions as pika_drv_exc
 from oslo_messaging._drivers.pika_driver import pika_message as pika_drv_msg
 
 LOG = logging.getLogger(__name__)
+
+
+class EmptyException(Exception):
+    pass
+
+
+class InterruptedException(Exception):
+    pass
+
+
+class Queue(object):
+    def __init__(self):
+        self._queue = collections.deque()
+        self._lock = threading.Lock()
+        self._pop_wake_condition = threading.Condition(self._lock)
+
+    def push(self, item):
+        with self._lock:
+            self._queue.appendleft(item)
+            self._pop_wake_condition.notify()
+
+    def pop(self, timeout):
+        with timeutils.StopWatch(timeout) as stop_watcher:
+            with self._lock:
+                while len(self._queue) == 0 and not stop_watcher.expired():
+                    self._pop_wake_condition.wait(
+                        stop_watcher.leftover(return_none=True)
+                    )
+
+                if len(self._queue) > 0:
+                    return self._queue.pop()
+                elif stop_watcher.expired():
+                    raise EmptyException()
+                else:
+                    raise InterruptedException()
+
+    def interrupt(self):
+        with self._lock:
+            self._pop_wake_condition.notify_all()
+
+    def empty(self):
+        return len(self._queue) == 0
 
 
 class PikaPoller(base.Listener):
@@ -54,22 +97,31 @@ class PikaPoller(base.Listener):
 
         self._queues_to_consume = None
 
-        self._message_queue = []
+        self._message_queue = Queue()
+
+    def _on_channel_close(self, channel, reply_code, reply_text):
+        LOG.warn("Channel closed received. Reconnecting...")
+        self._message_queue.interrupt()
 
     def _reconnect(self):
         """Performs reconnection to the broker. It is unsafe method for
         internal use only
         """
-        self._connection = self._pika_engine.create_connection(
-            for_listening=True
-        )
-        self._channel = self._connection.channel()
-        self._channel.basic_qos(prefetch_count=self._prefetch_count)
+        try:
+            self._connection = self._pika_engine.create_connection(
+                for_listening=True
+            )
+            self._channel = self._connection.channel()
+            self._channel.add_on_close_callback(self._on_channel_close)
+            self._channel.basic_qos(prefetch_count=self._prefetch_count)
 
-        if self._queues_to_consume is None:
-            self._queues_to_consume = self._declare_queue_binding()
+            if self._queues_to_consume is None:
+                self._queues_to_consume = self._declare_queue_binding()
 
-        self._start_consuming()
+            self._start_consuming()
+        except BaseException:
+            self._cleanup()
+            raise
 
     def _declare_queue_binding(self):
         """Is called by recovering connection logic if target RabbitMQ
@@ -123,7 +175,7 @@ class PikaPoller(base.Listener):
         """Is called by Pika when message was received from queue listened with
         no_ack=True mode
         """
-        self._message_queue.append(
+        self._message_queue.push(
             self._incoming_message_class(
                 self._pika_engine, None, method, properties, body
             )
@@ -133,7 +185,7 @@ class PikaPoller(base.Listener):
         """Is called by Pika when message was received from queue listened with
         no_ack=False mode
         """
-        self._message_queue.append(
+        self._message_queue.push(
             self._incoming_message_class(
                 self._pika_engine, self._channel, method, properties, body
             )
@@ -159,10 +211,17 @@ class PikaPoller(base.Listener):
                     LOG.exception("Unexpected error during closing connection")
             self._connection = None
 
-        for i in six.moves.range(len(self._message_queue) - 1, -1, -1):
-            message = self._message_queue[i]
-            if message.need_ack():
-                del self._message_queue[i]
+        buf = []
+        while True:
+            try:
+                msg = self._message_queue.pop(timeout=0)
+                if not msg.need_ack():
+                    buf.append(msg)
+            except EmptyException:
+                break
+
+        for msg in buf:
+            self._message_queue.push(msg)
 
     def poll(self, timeout=None, prefetch_size=1):
         """Main method of this class - consumes message from RabbitMQ
@@ -175,43 +234,36 @@ class PikaPoller(base.Listener):
         :return: list of PikaIncomingMessage, RabbitMQ messages
         """
 
+        res = []
         with timeutils.StopWatch(timeout) as stop_watch:
-            while True:
-                with self._lock:
-                    last_queue_size = len(self._message_queue)
-
-                    if (last_queue_size >= prefetch_size
-                            or stop_watch.expired()):
-                        result = self._message_queue[:prefetch_size]
-                        del self._message_queue[:prefetch_size]
-                        return result
-
-                    try:
-                        if self._started:
-                            if self._channel is None:
-                                self._reconnect()
-                            # we need some time_limit here, not too small to
-                            # avoid a lot of not needed iterations but not too
-                            # large to release lock time to time and give a
-                            # chance to perform another method waiting this
-                            # lock
-                            self._connection.process_data_events(
-                                time_limit=0.25
+            while len(res) < prefetch_size:
+                try:
+                    if self._started:
+                        if self._channel is None or not self._channel.is_open:
+                            self.reconnect()
+                        res.append(
+                            self._message_queue.pop(
+                                timeout=stop_watch.leftover(return_none=True)
                             )
-                        else:
-                            # consumer is stopped so we don't expect new
-                            # messages, just process already sent events
-                            self._connection.process_data_events(
-                                time_limit=0
+                        )
+                    else:
+                        timeout = stop_watch.leftover(return_none=True)
+                        if (self._channel is None or
+                                not self._channel.is_open):
+                            res.append(
+                                self._message_queue.pop(timeout=0)
                             )
-                            # and return result if we don't see new messages
-                            if last_queue_size == len(self._message_queue):
-                                result = self._message_queue[:prefetch_size]
-                                del self._message_queue[:prefetch_size]
-                                return result
-                    except pika_pool.Connection.connectivity_errors:
-                        self._cleanup()
-                        raise
+                        elif timeout is None or timeout > 1:
+                            timeout = 1
+                            res.append(
+                                self._message_queue.pop(timeout)
+                            )
+                except EmptyException:
+                    break
+                except InterruptedException:
+                    continue
+
+            return res
 
     def start(self):
         """Starts poller. Should be called before polling to allow message
@@ -220,19 +272,11 @@ class PikaPoller(base.Listener):
         with self._lock:
             if self._started:
                 return
-            self._started = True
 
             self._cleanup()
-            try:
-                self._reconnect()
-            except Exception as exc:
-                self._cleanup()
-                if isinstance(exc, pika_pool.Connection.connectivity_errors):
-                    raise pika_drv_exc.ConnectionException(
-                        "Connectivity problem detected during establishing "
-                        "poller's connection. " + str(exc))
-                else:
-                    raise exc
+            self._reconnect()
+
+            self._started = True
 
     def stop(self):
         """Stops poller. Should be called when polling is not needed anymore to
@@ -256,6 +300,14 @@ class PikaPoller(base.Listener):
                     else:
                         raise exc
             self._started = False
+
+    def reconnect(self):
+        """Safe version of _reconnect. Also execute cleanup if needed before
+        reconnecting.
+        """
+        with self._lock:
+            self._cleanup()
+            self._reconnect()
 
     def cleanup(self):
         """Safe version of _cleanup. Cleans up allocated resources (channel,

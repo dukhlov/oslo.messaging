@@ -11,59 +11,25 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-
+import os
 import random
 import socket
-import sys
 import threading
 import time
 
 from oslo_log import log as logging
 import pika
-from pika.adapters import select_connection
 from pika import credentials as pika_credentials
 import pika_pool
 import six
 
 from oslo_messaging._drivers.pika_driver import pika_exceptions as pika_drv_exc
+from oslo_messaging._drivers.pika_driver import pika_connection
+from stevedore import driver
 
 LOG = logging.getLogger(__name__)
 
 _EXCEPTIONS_MODULE = 'exceptions' if six.PY2 else 'builtins'
-
-
-def _is_eventlet_monkey_patched(module):
-    """Determines safely is eventlet patching for module enabled or not
-
-    :param module: String, module name
-    :return Bool, True if module is pathed, False otherwise
-    """
-
-    if 'eventlet.patcher' not in sys.modules:
-        return False
-    import eventlet.patcher
-    return eventlet.patcher.is_monkey_patched(module)
-
-
-def _create_select_poller_connection_impl(
-        parameters, on_open_callback, on_open_error_callback,
-        on_close_callback, stop_ioloop_on_close):
-    """Used for disabling autochoise of poller ('select', 'poll', 'epool', etc)
-    inside default 'SelectConnection.__init__(...)' logic. It is necessary to
-    force 'select' poller usage if eventlet is monkeypatched because eventlet
-    patches only 'select' system call
-
-    Method signature is copied form 'SelectConnection.__init__(...)', because
-    it is used as replacement of 'SelectConnection' class to create instances
-    """
-    return select_connection.SelectConnection(
-        parameters=parameters,
-        on_open_callback=on_open_callback,
-        on_open_error_callback=on_open_error_callback,
-        on_close_callback=on_close_callback,
-        stop_ioloop_on_close=stop_ioloop_on_close,
-        custom_ioloop=select_connection.SelectPoller()
-    )
 
 
 class _PooledConnectionWithConfirmations(pika_pool.Connection):
@@ -94,10 +60,8 @@ class PikaEngine(object):
     TCP_USER_TIMEOUT = 18
 
     def __init__(self, conf, url, default_exchange=None,
-                 allowed_remote_exmods=None):
+                 allowed_remote_exmods=None, executor="eventlet"):
         self.conf = conf
-
-        self._force_select_poller_use = _is_eventlet_monkey_patched('select')
 
         # processing rpc options
         self.default_rpc_exchange = (
@@ -178,6 +142,13 @@ class PikaEngine(object):
             self.conf.oslo_messaging_pika.heartbeat_interval
         )
 
+        self.executor_type = executor
+
+        mgr = driver.DriverManager('oslo.messaging.executors',
+                                   self.executor_type)
+        self._executor_cls = mgr.driver
+        self._executor = None
+
         # initializing connection parameters for configured RabbitMQ hosts
         common_pika_params = {
             'virtual_host': url.virtual_host,
@@ -239,6 +210,9 @@ class PikaEngine(object):
             _PooledConnectionWithConfirmations
         )
 
+        self._host_connections = [None] * len(self._connection_host_param_list)
+        self._pid = os.getpid()
+
     def _next_connection_num(self):
         """Used for creating connections to different RabbitMQ nodes in
         round robin order
@@ -296,6 +270,21 @@ class PikaEngine(object):
                 "Whoops, this kernel doesn't seem to support TCP_USER_TIMEOUT."
             )
 
+    def _reset_forked_child(self):
+        for conn in self._host_connections:
+            if conn is not None:
+                try:
+                    conn._impl.socket.close()
+                except:
+                    pass
+                try:
+                    conn.close()
+                except:
+                    pass
+            self._executor = None
+
+        self._host_connections = [None] * len(self._host_connections)
+
     def create_host_connection(self, host_index, for_listening=False):
         """Create new connection to host #host_index
         :param host_index: Integer, number of host for connection establishing
@@ -304,14 +293,26 @@ class PikaEngine(object):
         :return: New connection
         """
 
-        connection_params = pika.ConnectionParameters(
-            heartbeat_interval=(
-                self._heartbeat_interval if for_listening else None
-            ),
-            **self._connection_host_param_list[host_index]
-        )
-
         with self._connection_lock:
+            cur_pid = os.getpid()
+            if self._pid != cur_pid:
+                self._reset_forked_child()
+                self._pid = cur_pid
+
+            if self._executor is None:
+                self._executor = self._executor_cls()
+
+            connection = self._host_connections[host_index]
+            if connection is not None and connection.is_open:
+                return connection
+
+            connection_params = pika.ConnectionParameters(
+                heartbeat_interval=(
+                    self._heartbeat_interval if for_listening else None
+                ),
+                **self._connection_host_param_list[host_index]
+            )
+
             cur_time = time.time()
 
             last_success_time = self._connection_host_status_list[host_index][
@@ -333,10 +334,8 @@ class PikaEngine(object):
                 )
 
             try:
-                connection = pika.BlockingConnection(
-                    parameters=connection_params,
-                    _impl_class=(_create_select_poller_connection_impl
-                                 if self._force_select_poller_use else None)
+                connection = pika_connection.BlockingConnection(
+                    executor=self._executor_cls(), params=connection_params
                 )
 
                 # It is needed for pika_pool library which expects that
@@ -350,6 +349,8 @@ class PikaEngine(object):
                 self._connection_host_status_list[host_index][
                     self.HOST_CONNECTION_LAST_SUCCESS_TRY_TIME
                 ] = cur_time
+
+                self._host_connections[host_index] = connection
 
                 return connection
             finally:
